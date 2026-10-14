@@ -1,0 +1,12 @@
+.env
+.venv/
+ __pycache__/
+PROBLEM_STATEMENT.docx
+PROBLEM_STATEMENT.md
+openapi.yaml
+DATA_MODEL.md
+sample_data/
+sample_seed.py
+PLAN.md
+WALKTHROUGH.md
+local_tools/
