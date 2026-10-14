@@ -1,6 +1,7 @@
 .env
 .venv/
- __pycache__/
+__pycache__/
+.pytest_cache/
 PROBLEM_STATEMENT.docx
 PROBLEM_STATEMENT.md
 openapi.yaml

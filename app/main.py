@@ -98,13 +98,7 @@ app = FastAPI(
 )
 
 
-# Global exception handler ensuring validation errors return 422 with detail array
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": exc.errors()},
-    )
+
 
 
 # --------------------------------------------------------------------------- #
@@ -847,17 +841,14 @@ def punch_out(body: PunchOutRequest):
 
     punch_out_dt = datetime.fromtimestamp(p_ms / 1000, tz=timezone.utc)
 
-    # Find the employee's most recent record whose punch_in <= punched_at
+    # Find the employee's most recent record whose punch_in is not None
     record = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code, "punch_in": {"$lte": punch_out_dt}},
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None}},
         sort=[("punch_in", DESCENDING)]
     )
 
     if not record:
-        raise HTTPException(status_code=404, detail="No punch-in found for this punch-out instant")
-
-    if record.get("punch_out") is not None:
-        raise HTTPException(status_code=409, detail="Attendance record is already punched out")
+        raise HTTPException(status_code=404, detail="No punch-in found for employee")
 
     punch_in_dt = record["punch_in"]
     if punch_in_dt.tzinfo is None:
@@ -868,6 +859,9 @@ def punch_out(body: PunchOutRequest):
 
     if (punch_out_dt - punch_in_dt).total_seconds() > 86400:
         raise HTTPException(status_code=422, detail="punched_at cannot be more than 24 hours after punch_in")
+
+    if record.get("punch_out") is not None:
+        raise HTTPException(status_code=409, detail="Attendance record is already punched out")
 
     work_hours = compute_work_hours(punch_in_dt, punch_out_dt)
     overtime = compute_overtime(punch_out_dt, emp["shift_start"], emp["shift_end"], record["date"])
