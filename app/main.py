@@ -11,6 +11,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import json
 import os
 import re
+import time as time_mod
 from typing import Annotated, Any, Dict, List, Optional
 
 from bson import json_util
@@ -18,7 +19,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, BeforeValidator, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -31,10 +32,25 @@ load_dotenv(override=False)
 MONGO_URI = os.environ.get("MONGO_URI") or "mongodb://localhost:27017"
 MONGO_DB = os.environ.get("MONGO_DB") or "attendance_db"
 
-client: MongoClient = MongoClient(MONGO_URI, tz_aware=True)
+# FIX 3a: serverSelectionTimeoutMS=3000 so /health fails fast when Mongo is down
+client: MongoClient = MongoClient(MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=3000)
 db = client[MONGO_DB]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+
+# --------------------------------------------------------------------------- #
+# FIX 1a: Date parse helper – raises 422 on impossible calendar dates
+# --------------------------------------------------------------------------- #
+def parse_ymd(value: str) -> date:
+    """Parse a YYYY-MM-DD string into a date; raise HTTP 422 on invalid calendar dates."""
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid calendar date: '{value}' (e.g. 2026-02-30 or 2026-13-45 are rejected)"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -86,8 +102,23 @@ def ensure_indexes():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create indexes on startup
-    ensure_indexes()
+    # FIX 3b: Retry ensure_indexes for up to ~15 seconds so a slow-starting
+    # MongoDB does not crash the app.
+    deadline = time_mod.monotonic() + 15
+    last_err = None
+    while time_mod.monotonic() < deadline:
+        try:
+            ensure_indexes()
+            last_err = None
+            break
+        except Exception as exc:
+            last_err = exc
+            time_mod.sleep(1)
+    if last_err is not None:
+        # Log the error but don't crash – the app will still start and
+        # /health will report 503 until Mongo becomes available.
+        import sys
+        print(f"WARNING: ensure_indexes failed after retries: {last_err}", file=sys.stderr)
     yield
 
 
@@ -235,6 +266,10 @@ def serialize_employee(doc: dict) -> dict:
 
 
 def serialize_attendance(doc: dict) -> dict:
+    """
+    FIX 4: Always include work_hours (null if absent), plus existing defaults
+    for late_minutes, overtime_minutes, half_day, and history.
+    """
     res = dict(doc)
     res.pop("_id", None)
     res.pop("id", None)
@@ -244,6 +279,9 @@ def serialize_attendance(doc: dict) -> dict:
     res["late_minutes"] = res.get("late_minutes", 0)
     res["overtime_minutes"] = res.get("overtime_minutes", 0)
     res["half_day"] = res.get("half_day", False)
+    # FIX 4: work_hours must always be present (null when not yet computed)
+    if "work_hours" not in res:
+        res["work_hours"] = None
 
     raw_history = res.get("history") or []
     formatted_history = []
@@ -277,6 +315,16 @@ class EmployeeCreate(BaseModel):
     shift_start: str = Field(default="09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     shift_end: str = Field(default="18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     joined_on: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+    # FIX 1b: Reject impossible calendar dates (e.g. 2026-02-30, 2026-13-45) with 422
+    @field_validator("joined_on")
+    @classmethod
+    def validate_joined_on(cls, v: str) -> str:
+        try:
+            date.fromisoformat(v)
+        except ValueError:
+            raise ValueError(f"joined_on '{v}' is not a valid calendar date")
+        return v
 
     @model_validator(mode="after")
     def validate_shifts(self):
@@ -830,6 +878,7 @@ def punch_in(body: PunchInRequest):
 # 5. POST /attendance/punch-out
 @app.post("/attendance/punch-out", status_code=200, tags=["attendance"])
 def punch_out(body: PunchOutRequest):
+    # FIX 2: Revised punch-out record selection per openapi.yaml contract
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
@@ -841,33 +890,52 @@ def punch_out(body: PunchOutRequest):
 
     punch_out_dt = datetime.fromtimestamp(p_ms / 1000, tz=timezone.utc)
 
-    # Find the employee's most recent record whose punch_in is not None
+    # FIX 2 step 1: Find most recent record with punch_in <= punched_at.
+    # The index (emp_code, punch_in desc) serves this lookup.
     record = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code, "punch_in": {"$ne": None}},
+        {
+            "emp_code": body.emp_code,
+            "punch_in": {"$ne": None, "$lte": punch_out_dt}
+        },
         sort=[("punch_in", DESCENDING)]
     )
 
     if not record:
-        raise HTTPException(status_code=404, detail="No punch-in found for employee")
+        # FIX 2 step 2: Distinguish "no punch-in at all" vs "all punch-ins are later"
+        any_record = db.attendance_logs.find_one(
+            {"emp_code": body.emp_code, "punch_in": {"$ne": None}}
+        )
+        if any_record:
+            raise HTTPException(
+                status_code=422,
+                detail="punched_at must be after punch_in"
+            )
+        else:
+            raise HTTPException(status_code=404, detail="No punch-in found for employee")
 
     punch_in_dt = record["punch_in"]
     if punch_in_dt.tzinfo is None:
         punch_in_dt = punch_in_dt.replace(tzinfo=timezone.utc)
 
+    # FIX 2 step 3: Check already punched out BEFORE the 24-hour rule
+    if record.get("punch_out") is not None:
+        raise HTTPException(status_code=409, detail="Attendance record is already punched out")
+
+    # FIX 2 step 4: punched_at <= punch_in -> 422
+    # (equality: punch_in == punch_out is invalid per contract even though $lte filter
+    # would have included it; we re-check to ensure strictly-after semantics)
     if punch_out_dt <= punch_in_dt:
         raise HTTPException(status_code=422, detail="punched_at must be strictly greater than punch_in")
 
     if (punch_out_dt - punch_in_dt).total_seconds() > 86400:
         raise HTTPException(status_code=422, detail="punched_at cannot be more than 24 hours after punch_in")
 
-    if record.get("punch_out") is not None:
-        raise HTTPException(status_code=409, detail="Attendance record is already punched out")
-
     work_hours = compute_work_hours(punch_in_dt, punch_out_dt)
     overtime = compute_overtime(punch_out_dt, emp["shift_start"], emp["shift_end"], record["date"])
     half_day = compute_half_day(work_hours)
 
-    # Atomic conditional update
+    # FIX 2 step 5: Atomic conditional update – filter on punch_out=null so two
+    # simultaneous punch-outs give exactly one 200 and the rest 409.
     res = db.attendance_logs.update_one(
         {"_id": record["_id"], "punch_out": None},
         {
@@ -897,6 +965,12 @@ def list_attendance(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
+    # FIX 1d: Validate impossible calendar dates before any computation
+    if date_from:
+        parse_ymd(date_from)
+    if date_to:
+        parse_ymd(date_to)
+
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=422, detail="date_from must be on or before date_to")
 
@@ -928,6 +1002,9 @@ def regularize_attendance(
     date_str: str = Path(..., alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$"),
     body: RegularizeRequest = ...,
 ):
+    # FIX 1d: Validate impossible calendar dates before any computation
+    parse_ymd(date_str)
+
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
@@ -1074,7 +1151,27 @@ def employee_monthly(
     month_start = date(y, m, 1)
     month_end = date(y, m, num_days)
 
-    emp_joined = date.fromisoformat(emp["joined_on"])
+    # FIX 1e: Defensively handle malformed joined_on stored in DB.
+    # Choice: treat as 0 working days (and None attendance_pct).
+    # Rationale: the employee record is already in the DB; raising 422 would
+    # break every monthly report for that employee. Returning 0/None is a
+    # safe, self-documenting fallback that lets the caller know something is
+    # wrong without crashing. A data-repair job can fix the record later.
+    try:
+        emp_joined = date.fromisoformat(emp["joined_on"])
+    except (ValueError, KeyError, TypeError):
+        return {
+            "emp_code": emp_code,
+            "month": month,
+            "working_days": 0,
+            "present_days": 0.0,
+            "leave_days": 0,
+            "late_count": 0,
+            "total_late_minutes": 0,
+            "total_overtime_minutes": 0,
+            "attendance_pct": None
+        }
+
     start_calc = max(month_start, emp_joined)
 
     working_days = 0
@@ -1102,9 +1199,10 @@ def employee_monthly(
         total_late = 0
         total_ot = 0
 
+    # FIX 5: Use Decimal arithmetic for attendance_pct (2 dp, half-up)
     if working_days > 0:
-        att_pct_raw = (present_days / working_days) * 100
-        attendance_pct = round_half_up(att_pct_raw, 2)
+        att_pct_decimal = (Decimal(str(present_days)) / Decimal(str(working_days))) * Decimal("100")
+        attendance_pct = float(att_pct_decimal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     else:
         attendance_pct = None
 
@@ -1186,8 +1284,9 @@ def department_trend(
     from_date: str = Query(..., alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
     to_date: str = Query(..., alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
 ):
-    d_from = date.fromisoformat(from_date)
-    d_to = date.fromisoformat(to_date)
+    # FIX 1c: Validate impossible calendar dates BEFORE any computation
+    d_from = parse_ymd(from_date)
+    d_to = parse_ymd(to_date)
     if d_to < d_from:
         raise HTTPException(status_code=422, detail="'to' date must be on or after 'from' date")
     if (d_to - d_from).days > 92:
@@ -1204,12 +1303,17 @@ def department_trend(
     items = []
     for r in results:
         att_rate = r.get("attendance_rate")
+        # FIX 5: Use Decimal arithmetic for attendance_rate (4 dp, half-up)
         if att_rate is not None:
-            att_rate = round_half_up(att_rate, 4)
+            att_rate = float(
+                Decimal(str(att_rate)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            )
 
         mov_avg = r.get("moving_avg_7d")
         if mov_avg is not None:
-            mov_avg = round_half_up(mov_avg, 4)
+            mov_avg = float(
+                Decimal(str(mov_avg)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            )
 
         items.append({
             "date": r["date"],
@@ -1246,6 +1350,11 @@ def explain_endpoint(
     month_regex = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
     if endpoint == "attendance_list":
+        # FIX 1d: Validate impossible dates for explain endpoint too
+        if date_from:
+            parse_ymd(date_from)
+        if date_to:
+            parse_ymd(date_to)
         if date_from and date_to and date_from > date_to:
             raise HTTPException(status_code=422, detail="date_from must be on or before date_to")
         q, sort_spec, skip, page_sz = build_attendance_list_query(
@@ -1306,11 +1415,9 @@ def explain_endpoint(
             raise HTTPException(status_code=422, detail="department is required for department_trend explain")
         if not from_date or not to_date:
             raise HTTPException(status_code=422, detail="'from' and 'to' dates are required for department_trend explain")
-        try:
-            d_from = date.fromisoformat(from_date)
-            d_to = date.fromisoformat(to_date)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Invalid date format")
+        # FIX 1d: Validate impossible dates for explain endpoint too
+        d_from = parse_ymd(from_date)
+        d_to = parse_ymd(to_date)
         if d_to < d_from:
             raise HTTPException(status_code=422, detail="'to' date must be on or after 'from' date")
         if (d_to - d_from).days > 92:

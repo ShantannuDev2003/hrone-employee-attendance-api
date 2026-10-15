@@ -1,14 +1,21 @@
+# Secrets and environment files
 .env
+.env.*
+!.env.example
+
+# Python virtual environments
 .venv/
+.venv*/
+venv/
+
+# Python and test caches
 __pycache__/
+*.py[cod]
 .pytest_cache/
-PROBLEM_STATEMENT.docx
-PROBLEM_STATEMENT.md
-openapi.yaml
-DATA_MODEL.md
+.coverage
+htmlcov/
+
+# Assignment material and supplied data
+PROBLEM_STATEMENT*
 sample_data/
 sample_seed.py
-PLAN.md
-WALKTHROUGH.md
-local_tools/
-pytest.ini
